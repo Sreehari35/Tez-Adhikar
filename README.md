@@ -3,7 +3,7 @@
 > **Full Title**: Tez Adhikar — Access Control & Audit Service  
 > **Short Description**: A centralized authorization service that ensures every user can perform only the actions permitted by their role, scope, and the shipment's current state.
 
-
+https://tez-adhikar.onrender.com/
 ---
 
 ## 1. Quick Start
