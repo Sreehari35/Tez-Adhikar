@@ -1,188 +1,103 @@
-# Tez Adhikar — Access Control & Audit Service: System Design & Architecture Document
-> **Tagline**: Right Access. Right Authority.  
-> **Short Description**: A centralized authorization service that ensures every user can perform only the actions permitted by their role, scope, and the shipment's current state.
+# Tez Adhikar — Access Control & Audit Service
+**Nagarkot Forwarders Pvt. Ltd. (NFPL)**  
+*Design document | “Right Access. Right Authority.”*
 
-## 1. Executive Summary & Philosophy
+## 1. Purpose and design principles
 
-Nagarkot Forwarders Pvt. Ltd. (NFPL) operates across 5 branches with ~120 staff handling thousands of sensitive customs declarations. The core business requirement is a security model that is **strict where it matters** (immutable filed declarations, separation of duties, tamper-evident audit trails, privilege escalation prevention) yet **resilient and frictionless in day-to-day operations** (delegation during absence, seamless handoffs when staff responsibilities change, zero-code role additions, and sub-50 ms response times on 200,000+ jobs).
+Tez Adhikar centralizes authorization for shipment-processing jobs. A job belongs to one client, branch, direction (import/export), and mode (air, FCL, or LCL), and normally moves through **Confirmed → Prepared → Checked → Filed**. It may also enter controlled exception states such as Cancelled or Reopened.
 
-Our implementation is built exclusively on Python 3.10+ standard libraries and SQLite in WAL mode. It enforces a strict **fail-closed** architecture: any indeterminate state, missing grant, or unhandled exception immediately denies access and logs a security event.
+The design follows **least privilege, deny by default, separation of duties (SoD), explicit scope, auditable changes, and revalidation at the time of action**. Reading a job and changing it are separate permissions. A role describes allowed actions; a grant assigns a role to a person for a defined scope and period. An administrator does not automatically receive shipment-processing authority.
 
----
+The service is intended for Python 3.10+ with the standard library and SQLite. SQLite is suitable for this single-service assessment and its 500-user/200,000-job target when queries are indexed and paginated. It is not a substitute for a multi-writer distributed database or independently protected audit storage. Performance claims should be based on repeatable benchmarks rather than assumptions.
 
-## 2. Core Architecture & Data Model
+## 2. Model and key decisions
 
-### 2.1 Storage Architecture: SQLite in WAL Mode
-- **WAL Mode & Pragmas**: Configured with `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA cache_size = -64000;`.
-- **Indexing Strategy**:
-  - `idx_jobs_filter`: Composite covering index on `(stage, client_id, branch, direction, mode, id)` enabling SQLite index-only scans for scoped queries.
-  - `idx_jobs_prepared_by`: Indexes the preparer identity to enforce real-actor Separation of Duties (SoD).
-  - `idx_grants_user_active`: `(user_id, closed_at, valid_from, valid_to)` for sub-millisecond active grant lookups.
-  - `idx_grants_time_travel`: `(recorded_at, closed_at, valid_from, valid_to)` supporting point-in-time forensic replays.
-  - Keyset pagination (`WHERE id > :after ORDER BY id ASC LIMIT :limit`) guarantees $O(1)$ page traversal regardless of table depth.
+### Identity, roles, and grants
+A user has an active/inactive status. A role contains named permissions such as `view_job`, `prepare`, `check`, `file`, `cancel_filed`, `reopen`, and `manage_access`. A grant connects a user to a role and records its scope, start/end validity, creator, and lifecycle. Scope dimensions are client, branch, direction, and mode. Use an explicit `ALL` value for an intentional wildcard; a missing or malformed dimension is not silently interpreted as unrestricted access. Explicit deny rules, where supported, take precedence over matching allows.
 
-### 2.2 Roles as Data
-Roles are stored as first-class relational records in the `roles` table rather than hardcoded enums. Each role defines a JSON array of allowed actions (`permissions`), an `is_active` flag, and descriptions:
-- Standard roles: `Maker`, `Checker`, `Filer`, `Supervisor`, `Viewer`, `ClientViewer`, `AccessAdmin`, `Auditor`, `Service`.
-- **Zero-Code Extensibility**: Operations can validate permissions, test via the blast-radius simulator, and activate new roles in production without engineering deployment or code changes.
+Typical roles include Maker, Checker, Filer, Supervisor, ClientViewer, AccessAdmin, Auditor, and a restricted parser service identity. These are policy examples; the effective permissions must come from the configured role and grant records.
 
-### 2.3 Bitemporal Grant Model
-Grants track two distinct time dimensions simultaneously:
-1. **Valid Time (Business Time)**: `valid_from` and `valid_to` define when the business permission is effective in the physical world.
-2. **Recorded Time (System Time)**: `recorded_at` and `closed_at` record when the system became aware of the grant.
-- **Immutability Principle**: Grants are **never deleted**. Revoking or superseding a grant writes `closed_at = now()`. This enables forensic queries to inspect both "what was valid on March 3rd" and "what did the database believe on March 3rd".
+### Authorization and workflow
+For every protected request, validate the authenticated actor, active status, permission, grant validity, target-job scope, workflow transition, and applicable SoD restrictions. Re-check these conditions inside the transaction that performs the mutation so a stale earlier decision cannot authorize a later change. Return a structured decision with an allow/deny result and reason code; do not expose another client’s records through explanations, counts, or error messages.
 
-### 2.4 State Machine & Pipeline Invariants
-Jobs progress through explicit stages:
-$$\text{Confirmed} \xrightarrow{\text{prepare}} \text{Prepared} \xrightarrow{\text{check}} \text{Checked} \xrightarrow{\text{file}} \text{Filed}$$
-Auxiliary states include `Cancelled` and `Reopened`.
-- Transitions outside the state table are denied at Step 1 (`DENIED_BY_STAGE`).
-- Active jobs may be cancelled or reopened by authorized branch staff.
-- Once a job reaches `Filed`, it is cryptographically sealed and strictly immutable. Any attempt to modify it via standard API writes triggers an immediate security alert. Cancellation or reopening of a `Filed` job requires a Supervisor grant, a mandatory justification reason, and a distinct second approver.
+The normal workflow permits only defined transitions. The preparer must not check or file the same job, even if they also hold a Checker or Supervisor role or act as a delegate. A filed job must not be edited through ordinary update paths. Cancelling or reopening a filed job is an exceptional workflow: require a scoped Supervisor request, a business reason, approval by a different eligible Supervisor, and a re-check of the job state and approval immediately before committing the transition. The approval must be authenticated and bound to the exact job, action, reason, requester, expected state, and expiry—not inferred from a caller-supplied approver ID.
 
-### 2.5 Dual-Execution Unified Predicate Compiler
-To eliminate discrepancies between individual authorization checks and queue listings, a single compiler in `app/predicate.py` ingests user grants and outputs:
-1. **In-Memory Evaluator**: Python callable `(job_dict) -> bool` for real-time memory evaluations.
-2. **SQL WHERE Clause**: Parameterized SQLite SQL fragment `(where_sql, params)` applied directly in `SELECT COUNT(*)` and `SELECT ... LIMIT 50` queries.
-Both pathways evaluate identical Boolean expressions (stage, scope dimensions, and preparer SoD exclusions).
+### Persistence, audit, and history
+Use SQLite transactions and foreign keys for related changes, with indexes on job scope/stage, grant lookup fields, and audit sequence. Use bounded pagination for large lists. Keep audit events append-only at the application layer and record actor, action, target, timestamp, reason, outcome, and relevant before/after identifiers without unnecessarily copying sensitive payloads.
 
----
+A hash- or HMAC-chained audit ledger can reveal alteration of recorded events if verification is correct and the key is protected separately. It does not prevent a privileged attacker from deleting the database and key together, nor prove that every real-world event was recorded. Production deployment should back up the ledger, restrict key access, and export or replicate audit evidence to a separately controlled destination. Filing seals should cover a canonical representation of the filed data and be verified on read or before exceptional operations.
 
-## 3. Cryptographic Security Features
+Historical queries must distinguish **who had authority** from **who actually acted**. Reconstructing past authority requires retained historical versions of users, roles, grants, delegations, and relevant job attributes. If the evidence is incomplete, report that limitation instead of presenting a definitive answer.
 
-### 3.1 Chained HMAC Audit Ledger
-Every system mutation (grant creation, grant closure, delegation, transition, break-glass invocation, probe alert) appends a row to `audit_ledger`:
-$$\text{RowHash}_i = \text{HMAC-SHA256}\Big(K_{\text{ledger}}, \text{RowHash}_{i-1} \,\|\, \text{CanonicalJSON}(\text{Event}_i)\Big)$$
-- Deterministic serialization (sorted keys, compact separators, UTF-8) guarantees identical byte representation across platforms.
-- Secret key $K_{\text{ledger}}$ is loaded from an environment variable (`NAGARKOT_LEDGER_KEY`) or secure keyfile; it is never committed to code.
-- `cli verify` traverses the ledger sequentially; any altered event or broken link reports the exact corrupted sequence number.
+## 3. Answers to the design questions
 
-### 3.2 Cryptographic Job Seal
-When a job enters `Filed`, the service computes an HMAC-SHA256 seal of its canonical payload (client, branch, direction, mode, participants, and customs declaration content) and stores it in `seal_hash`.
-- `cli verify-jobs` scans all filed jobs and recalculates seals. Any out-of-band direct SQL modification (e.g., rogue DBA or insider altering invoice values or tariff codes) is flagged immediately.
+**Q1. Should everyone see everything? How does visibility differ from authority?**  
+No. Internal staff see jobs within their permitted client/branch scope; auditors may receive broader read-only access when justified. A ClientViewer sees only their own client’s approved shipment fields. `view_job` permits reading but never implies permission to prepare, check, file, cancel, or reopen.
 
-### 3.3 Blast-Radius Simulator
-Before granting privileges, administrators can execute a dry-run via `cli simulate-grant`:
-- Evaluates jobs gained across the current database.
-- Detects latent Separation of Duties conflicts (jobs previously prepared by the user where this new grant would attempt to give check/file permissions).
-- Alerts if the grantor is attempting to elevate their own privileges.
-- Performs zero writes to storage.
+**Q2. Maker for every client but Checker for a few; Checker limited to one branch and imports?**  
+Represent each responsibility as a separate grant. For example, a Maker grant can explicitly cover all clients while a Checker grant covers only C01 and C02. Another Checker grant can be restricted to client C03, the Mumbai branch, and imports. Wildcards must be explicit, and each dimension must be checked against the job.
 
-### 3.4 Probe Detection & MITRE ATT&CK Mapping
-Brute-force permission discovery and credential probing are intercepted:
-- Denials within a 5-minute sliding window are tracked per actor. Exceeding threshold (5 denials) writes an `ANOMALY` event to the cryptographic ledger.
-- Mapped directly to **MITRE ATT&CK T1078 (Valid Accounts)** and **T1087 (Account Discovery / Permission Enumeration)**.
-- Any write attempt on a `Filed` job logs an `ALERT` event.
+**Q3. What if the preparer is also qualified to approve?**  
+Deny checking or filing when the authenticated actor is the recorded preparer. A second role or delegated permission does not override SoD. Record the denial with a clear reason code.
 
----
+**Q4. What if the responsible person is absent?**  
+An authorized Supervisor may delegate eligible authority to a qualified colleague for a defined scope and time window. A delegation cannot exceed the delegator’s authority, must be auditable, and must not permit sub-delegation unless policy explicitly allows it. The delegate remains subject to scope, expiry, workflow, explicit denies, and SoD.
 
-## 4. Answers to the 14 Design Questions
+**Q5. What happens to in-progress jobs when responsibilities change?**  
+Re-evaluate access on every action. Close or expire superseded grants, invalidate affected credentials/sessions, and reassign outstanding work through an audited process. Preserve completed actions and their original actor attribution; do not rewrite history to make the new assignee appear to have performed earlier work.
 
-### Q1: Should everyone see everything? If not, who sees what? How does that differ from who may act?
-**Answer**: No. Internal staff view only jobs matching their assigned branch and client grant scope (plus regional supervisors who see their branch cluster, and Auditors who have cross-branch read-only audit visibility). Client users (`ClientViewer`) see strictly their own client's shipments.
-- **Visibility vs. Authority**: Visibility (Read) allows monitoring status and timelines. Authority (Action) requires active pipeline grants (`prepare`, `check`, `file`, `cancel`, `reopen`). Having visibility into a job confers zero right to advance or modify it.
+**Q6. Who can cancel a filed job or reopen a closed one?**  
+Only a scoped Supervisor may request the exception, with a meaningful reason and independent approval from another eligible Supervisor. Bind approval to the specific request and expire it. Re-check permissions and state in the same transaction as the transition. Preserve the original filing and record the exception as a new event.
 
-### Q2: How would you describe someone who is a Maker for every client but a Checker for only a few? What about someone who is a Checker for one client at one branch, but only for imports?
-**Answer**: Scopes are multidimensional JSON objects with dimensions `clients`, `branches`, `directions`, `modes`. An empty/omitted list denotes a wildcard (ALL).
-- *Asha* (Maker everywhere, Checker for few):
-  - Grant 1: `Role: Maker, Scope: {}` (Wildcard across all clients, branches, directions, modes).
-  - Grant 2: `Role: Checker, Scope: {"clients": ["C01", "C02", "C03"]}`.
-- *Ravi* (Checker for one client, one branch, imports only):
-  - Grant: `Role: Checker, Scope: {"clients": ["C03"], "branches": ["Mumbai"], "directions": ["import"]}`.
+**Q7. What if a client employee wants to follow shipments?**  
+Give them a client-scoped, read-only role. Enforce the client boundary on details, lists, counts, audit views, and historical endpoints. Return only fields approved for client viewing; redact internal notes, margins, tariff commentary, and staff details where policy requires it.
 
-### Q3: What if the person who prepared a checklist is also qualified to approve it?
-**Answer**: Separation of Duties (SoD) is strictly enforced at the authorization layer. Regardless of how many Checker or Supervisor grants an individual holds, if `job.prepared_by == actor_id`, any attempt to `check` or `file` that job returns `DENY` with code `DENIED_BY_SOD`.
+**Q8. What if an admin must fix a stuck job or tries to escalate their own privileges?**  
+Separate `manage_access` from shipment permissions. Do not let an AccessAdmin grant themselves authority or approve their own privilege increase. For emergencies, use a narrowly scoped, short-lived break-glass workflow with a reason, independent review, and complete audit. If those controls are unavailable, deny the exceptional mutation and use a documented manual recovery process.
 
-### Q4: What if the person responsible for a job is absent?
-**Answer**: A Supervisor can issue a time-bounded **Delegation** to a qualified colleague:
-- Limited strictly to the delegator's own authorized scope.
-- Enforces a finite validity window (`valid_from` to `valid_to`).
-- Chaining is strictly prohibited (a delegate cannot sub-delegate).
-- Fully recorded in the audit ledger.
+**Q9. How should the overnight parser be treated?**  
+Use a dedicated service identity and secret, not a shared human account. Limit it to required ingestion operations and permitted fields/stages. It must not manage users or grants, check/file jobs, reopen filed jobs, or alter audit records. Authenticate requests, validate input, rate-limit where appropriate, and audit its actions separately.
 
-### Q5: What happens to jobs a person is halfway through when their responsibilities change?
-**Answer**: When a grant is revoked or superseded:
-1. The grant is bitemporally closed (`closed_at = now()`).
-2. Any in-progress jobs claimed (`assigned_to = user_id`) are automatically released back to the branch pool (`assigned_to = NULL`).
-3. A `reassigned` event is appended to the audit ledger.
-4. Historical attribution is preserved: past work (`prepared_by`, `checked_by`, `filed_by`) remains permanently attributed to the original person.
+**Q10. How do you explain “why can she do this and he can’t?”**  
+Evaluate both users against the same job and action, then return a side-by-side explanation: active grants, scope matches/mismatches, stage rule, explicit deny, SoD result, and final reason code. Apply the same visibility policy to the explanation so it cannot reveal a job or client to an unauthorized caller.
 
-### Q6: Who should be able to cancel a filed job or reopen a closed one? What should it take?
-**Answer**: A filed customs declaration is a legal submission to government authorities. Cancelling or reopening requires:
-1. Active `Supervisor` grant matching the job's scope.
-2. A mandatory, non-empty business justification reason.
-3. Explicit approval from a **second, distinct Supervisor** (`second_approver_id != requester_id`).
-Self-approval is blocked and logged.
+**Q11. How do you answer “who could have changed this job on the 3rd?”**  
+Resolve the date, time, and timezone. Report separately (1) users whose historically recorded grants and role definitions permitted the action at that time and (2) audited events showing who actually performed recorded actions. Exclude events recorded after the historical cutoff when reconstructing what the system knew then. State when retained evidence is insufficient.
 
-### Q7: What if a client's own employee needs to follow their shipments?
-**Answer**: Assigned the role `ClientViewer` tied to their `client_id` (e.g. Priya for `C02`):
-- Action is restricted to `view` only (any create/update/pipeline action is rejected with `DENIED_CLIENT_USER_VIEW_ONLY`).
-- Job must match their client (`job.client_id == user.client_id`).
-- All internal fields are redacted: internal staff identities (`prepared_by`, `checked_by`, `filed_by`), internal margins, tariff notes, and financial markups are stripped from the JSON response.
+**Q12. How can a new role be introduced while engineering is busy?**  
+Store role definitions as validated data, with a fixed vocabulary of supported permissions. An authorized administrator proposes the role, reviews its scope and impact, obtains required approval, and activates it through a controlled workflow. Do not allow arbitrary permission strings or use “no-code” role creation to bypass privilege checks. Changes should be audited and covered by regression tests.
 
-### Q8: What if an admin needs to fix a stuck job? What if an admin tries to make themselves more powerful?
-**Answer**:
-- **Job Action Separation**: `AccessAdmin` has only `manage_access` permission. Admins are strictly forbidden from executing job pipeline actions (`prepare`, `check`, `file`, etc.).
-- **Self-Escalation Blocked**: An admin cannot grant themselves roles or approve grants targeting themselves. Any privilege change to an admin requires a distinct second admin.
-- **Emergency Fix (Break-Glass)**: If urgent intervention is required, the admin invokes `/breakglass` with a mandatory reason. It expires automatically in 30 minutes, writes an immediate security `ALERT` to the immutable ledger, and requires subsequent ratification by a second administrator.
+**Q13. How can “jobs waiting for me” match what a person can actually do?**  
+Use the same policy semantics for authorization, queues, and counts. If SQL is used to filter lists, test it against the authorization evaluator for scope, grant validity, stage, denies, and SoD. Apply pagination after policy filtering or prove the filtering order is equivalent. Test parity with deterministic edge cases and randomized comparisons.
 
-### Q9: How should an automated parser that creates and updates jobs overnight be treated?
-**Answer**: The parser operates under a dedicated Service identity (`svc_parser`) authenticated via a salted hash of its secret API key.
-- Constrained strictly to `create` and `update` actions on jobs in the `Confirmed` stage.
-- Blocked from touching `Prepared`, `Checked`, or `Filed` jobs.
-- Blocked from administrative and user-management actions.
+**Q14. What should happen when the system is unsure?**  
+Fail closed for protected actions. Missing identity, invalid policy, unavailable database, missing audit key, or indeterminate state must never become an allow. Return a safe error/denial and log it where possible. If a required audit write cannot be committed, do not commit the sensitive mutation unless a documented policy explicitly defines a safe alternative.
 
-### Q10: How do you answer “why can she do this and he can't?”
-**Answer**: The explainer engine evaluates both users against the requested action on the job:
-- Side-by-side comparison of active grants, scope evaluation, stage machine transition validity, and SoD rules.
-- Accessible via API `GET /explain?user=A&other=B&action=X&job=J` and CLI `cli explain`.
-- Outputs an actionable summary (e.g. *"User A is ALLOW (matching_grant G_ASHA_CHK), whereas User B is DENY (DENIED_BY_SCOPE: client mismatch)"*).
+**Q15. How should access be revoked when an employee leaves or changes roles?**  
+Deactivate the account, revoke grants and delegations, invalidate credentials/sessions, and prevent new actions immediately. Reassign open work through an audited process while preserving past actor attribution. Make offboarding idempotent and test retries, partial failures, and stale sessions.
 
-### Q11: How do you answer “who could have changed this job on the 3rd?”
-**Answer**: The **Forensic Time Machine** (`cli who-could-change --job J --at <timestamp>`):
-- Queries grants bitemporally: `recorded_at <= T AND (closed_at IS NULL OR closed_at > T) AND valid_from <= T AND valid_to >= T`.
-- Reconstructs all staff who possessed valid authority on that job at that specific historical instant.
-- Cross-references the cryptographic audit ledger to display who *actually* executed modifications around that time.
+**Q16. What if a delegate is also the preparer?**  
+Evaluate SoD against the real authenticated actor, not the delegator’s identity. If the delegate prepared the job, deny their check/file action even when the delegation otherwise grants the necessary role. Delegation never overrides SoD or explicit denies.
 
-### Q12: How would a new kind of role be introduced next quarter while engineering is busy?
-**Answer**: Roles are stored in the database as data:
-1. Administrator defines the new role with allowed action permissions.
-2. Runs the blast-radius simulator (`cli simulate-grant`) to dry-run impact.
-3. Calls `POST /roles` or inserts into `roles` table.
-4. Role is instantly active across the predicate compiler and decision engine with zero engineering code changes or service restarts.
+**Q17. What if two people act at the same time or a request uses stale state?**  
+Perform the final authorization and state-transition check within a database transaction. Use a conditional update or version/state check so only one valid transition wins. If another request changes the job first, reject the stale request and require the caller to refresh; never silently apply an action to a different state.
 
-### Q13: How do you make sure a person's “jobs waiting for me” count matches what they can actually do?
-**Answer**: The Unified Predicate Compiler guarantees that the SQL WHERE clause executed for list/count queries is mathematically identical to the Boolean logic used for authorization decisions.
-- Includes role actions, scope constraints, and the SoD clause `(prepared_by IS NULL OR prepared_by != :current_user_id)`.
-- Verified via property-based automated tests comparing in-memory execution against SQL queries over 1,200+ random (user, job) permutations.
+**Q18. What if someone tampers with or deletes audit records, replays a request, or the key is lost?**  
+Verify the ledger chain and filing seal, alert on sequence gaps or mismatches, and keep protected backups or an independently controlled audit copy. Use unique request/approval identifiers and expiry to prevent replay of sensitive approvals. Rotate and back up keys under controlled access. If a required verification key is unavailable, report verification as unavailable and deny operations that depend on it; do not claim the ledger is verified.
 
-### Q14: What should happen when your system is unsure?
-**Answer**: The system **fails closed**. Any unexpected error, database disconnection, corrupt JSON payload, or indeterminate condition immediately returns `decision: DENY` with `code: INDETERMINATE`. The anomaly is captured and recorded to the audit ledger.
+**Q19. What if authorization, the database, or audit storage fails?**  
+Fail closed for protected operations and return a clear operational error without exposing secrets. Use transactions so a state change and its required audit event either both commit or neither commits. Provide health checks and recovery procedures; do not fall back to permissive cached decisions or unaudited writes.
 
----
+**Q20. How will correctness and performance be maintained as the system grows?**  
+Add indexes based on measured query plans, use bounded/keyset pagination, and avoid loading all jobs into memory. Benchmark realistic datasets near 500 users and 200,000 jobs, including worst-case scope filters and counts. Test access boundaries, transition invariants, SoD, offboarding, audit verification, concurrency, and list/count parity. Treat performance numbers as measured results tied to the test environment, not universal guarantees.
 
-## 5. Answers to the 2 Additional Questions
+## 4. Trade-offs and scope
 
-### Q15: Offboarding: How does the system handle immediate termination of staff?
-**Answer**:
-1. Setting `users.is_active = 0` and closing all associated grants (`closed_at = now()`) instantly invalidates active authentication tokens and authorization checks.
-2. The `grants_version` counter increments, guaranteeing no stale cached decisions exist.
-3. In-progress jobs claimed by the departing user (`assigned_to = user_id`) are immediately returned to the unassigned branch pool (`assigned_to = NULL`).
-4. A `reassigned` event is written to the cryptographic audit ledger.
-5. Historical records are preserved: historical attribution (`prepared_by`, `checked_by`, `filed_by`) remains intact to satisfy legal customs audit requirements.
+- **SQLite and a single service:** simple to run and inspect for this assessment; concurrency and deployment needs should be reassessed before multi-instance production use.
+- **Data-driven roles:** faster to extend, but role edits require validation, approval, audit, and tests.
+- **HMAC-chained audit:** efficient tamper evidence when the secret is protected; it is not a digital signature and cannot independently prove completeness.
+- **Fail-closed behavior:** protects integrity but may temporarily block work during an outage; documented recovery and monitoring are therefore necessary.
+- **Historical reconstruction:** useful only to the extent that versions and events were retained accurately.
+- **Security boundary:** authorization must be enforced server-side on every endpoint; hiding UI controls is not an access-control mechanism.
 
-### Q16: Delegate-is-also-preparer: What if Karan (delegate for Meera, a Supervisor) prepared a job, and that job moves to Checked? Can Karan approve/check it under Meera's delegated Supervisor authority?
-**Answer**: **Strictly No**. Separation of Duties evaluates the **real actor**, not the assumed persona. Even though Meera's delegated Supervisor grant confers checking authority, the engine identifies `actor_id == "u_karan"`. Because `job.prepared_by == "u_karan"`, the request is denied with `DENIED_BY_SOD`. A delegator cannot transmit immunity from SoD to a delegate.
-
----
-
-## 6. What I Cut and Why (Scope Decisions & Trade-Offs)
-
-1. **No External Frameworks (FastAPI/Flask) or Third-Party Libraries**:
-   - *Rationale*: Adhered strictly to the constraint of Python standard library only. Built a robust REST server using `http.server` and native `urllib.parse`. Zero dependency vulnerabilities, zero install friction, sub-millisecond cold start.
-2. **No Heavy Distributed Cache (Redis/Memcached)**:
-   - *Rationale*: Distributed caches introduce cache invalidation bugs and stale authorization states. Replaced with an in-database monotonic `grants_version` counter and SQLite index scans in WAL mode. Grant changes take effect instantly while maintaining sub-15 ms queries.
-3. **No Heavy Asymmetric Public-Key Infrastructure (RSA/ECDSA) for Receipts**:
-   - *Rationale*: RSA/ECDSA signature generation introduces significant CPU overhead (several milliseconds per decision). Using HMAC-SHA256 with an environment-secured key provides complete tamper-evidence, verification speed, and throughput exceeding 8.7 million operations per second within <100 MB RAM.
-4. **No Ad-Hoc Dynamic SQL Strings**:
-   - *Rationale*: To prevent SQL injection risks, all SQL generation in the predicate compiler uses strictly parameterized placeholders (`:prep_0_client_id_0`) mapped to bound parameter dictionaries.
+The implementation should be judged against automated tests and the actual running service. Features described here are design requirements unless verified in code; do not represent a control as implemented merely because it is documented.
