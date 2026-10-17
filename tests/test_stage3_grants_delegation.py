@@ -177,6 +177,36 @@ class TestStage3GrantsAndDelegation(unittest.TestCase):
         self.assertGreaterEqual(len(replay["actual_history_events"]), 1)
         self.assertEqual(replay["actual_history_events"][0]["actor_id"], "u_maker")
 
+    def test_scaled_job_id_aliases_resolve_to_stored_id(self):
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO jobs (id, client_id, branch, direction, mode, stage, prepared_by, assigned_to, created_at, updated_at)
+                VALUES ('JOB_0000051', 'C01', 'Mumbai', 'import', 'air', 'Prepared', 'u_maker', 'u_maker', datetime('now'), datetime('now'))
+                """
+            )
+            record_ledger_event(
+                self.conn,
+                event_type="job_prepared",
+                entity_type="job",
+                entity_id="JOB_0000051",
+                actor_id="u_maker",
+                details={"step": "checklist_verified"},
+                timestamp="2026-01-01T10:00:00Z",
+            )
+
+        replay = self.service.who_could_change(job_id="JOB_0051", at_timestamp="2026-01-01T12:00:00Z")
+        self.assertEqual(replay["job_id"], "JOB_0000051")
+        self.assertEqual(replay["actual_history_events"][0]["event_type"], "job_prepared")
+
+        explanation = self.service.explain(
+            user_a_id="u_maker",
+            user_b_id="u_third",
+            action="check",
+            job_id="JOB_0051",
+        )
+        self.assertEqual(explanation["job_id"], "JOB_0000051")
+
     def test_breakglass_and_ratification(self):
         # Dev invokes breakglass
         bg = self.service.trigger_breakglass(admin_id="admin_dev", reason="Critical outage on customs gateway")

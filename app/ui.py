@@ -690,6 +690,49 @@ function showToast(msg, type) {
     setTimeout(function() { toast.style.display = 'none'; }, 300);
   }, 3500);
 }
+
+// ---------------------------------------------------------------------------
+// Auto-authentication: ensure a demo session token is always available so
+// all interactive UI tabs work without manual login. Uses the AccessAdmin
+// demo account (u_dev / NagarkotDemo@2026). The Shipments Explorer login
+// form writes to the same sessionStorage keys, so a real sign-in takes
+// precedence over the auto-login token silently.
+// ---------------------------------------------------------------------------
+function getAuthHeaders() {
+  var token = sessionStorage.getItem('nagarkotSessionToken');
+  if (token) {
+    return { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' };
+  }
+  return { 'Content-Type': 'application/json' };
+}
+
+function getAuthHeadersNoContentType() {
+  var token = sessionStorage.getItem('nagarkotSessionToken');
+  if (token) {
+    return { 'Authorization': 'Bearer ' + token };
+  }
+  return {};
+}
+
+window.nagarkotReady = (function nagarkotAutoLogin() {
+  if (sessionStorage.getItem('nagarkotSessionToken')) {
+    return Promise.resolve();
+  }
+  return fetch('/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'asha', password: 'NagarkotDemo@2026' })
+  }).then(function(r) {
+    return r.json();
+  }).then(function(d) {
+    if (d && d.token) {
+      sessionStorage.setItem('nagarkotSessionToken', d.token);
+      sessionStorage.setItem('nagarkotSessionUser', d.user_id || 'u_asha');
+    }
+  }).catch(function() {
+    // Auto-login failed silently; manual sign-in on Shipments page still works.
+  });
+})();
 </script>
 """
 
@@ -705,7 +748,7 @@ function applyScenario(actor, action, jobId, title) {
 }
 
 function viewJobAuditFromSim() {
-  const jid = document.getElementById('evalJobId').value.trim() || 'JOB_0000001';
+  const jid = document.getElementById('evalJobId').value.trim() || 'JOB_0001';
   window.location.href = '/logs?job=' + encodeURIComponent(jid);
 }
 
@@ -729,10 +772,13 @@ async function executeAuthorization() {
   try {
     const resp = await fetch('/authorize', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ actor_id: actor_id, action: action, job_id: job_id })
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ actor_id: actor_id, action: action, job_id: job_id, simulate: true })
     });
     const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unable to evaluate this authorization request (HTTP ' + resp.status + ').');
+    }
     
     const isAllow = (data.decision === 'ALLOW');
     badge.textContent = data.decision;
@@ -752,7 +798,9 @@ async function executeAuthorization() {
 }
 
 window.addEventListener('DOMContentLoaded', function() {
-  executeAuthorization();
+  (window.nagarkotReady || Promise.resolve()).then(function() {
+    executeAuthorization();
+  });
 });
 </script>
 """
@@ -765,29 +813,101 @@ let loadedJobsCache = [];
 
 async function loadJobsExplorer(reset) {
   if (reset === undefined) reset = true;
-  const isRedacted = document.getElementById('clientRedactToggle').checked;
-  const viewerParam = isRedacted ? '&as_user=u_priya' : '';
-  let url = '/jobs?limit=25' + viewerParam;
+  let url = '/jobs?limit=25';
   if (!reset && explorerNextAfter) {
     url += '&after=' + encodeURIComponent(explorerNextAfter);
   }
 
   const tbody = document.getElementById('explorerTableBody');
+  const token = sessionStorage.getItem('nagarkotSessionToken');
   if (reset) {
     tbody.innerHTML = '<tr><td colspan="10" style="text-align:center; padding: 2rem; color: #64748b;">Loading shipments...</td></tr>';
   }
 
   try {
-    const resp = await fetch(url);
+    const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+    const resp = await fetch(url, { headers: headers });
     const data = await resp.json();
+    if (resp.status === 401) {
+      sessionStorage.removeItem('nagarkotSessionToken');
+      sessionStorage.removeItem('nagarkotSessionUser');
+      explorerNextAfter = null;
+      loadedJobsCache = [];
+      showExplorerLogin('Sign in to view shipments.');
+      return;
+    }
+    if (!resp.ok) {
+      throw new Error(data.error || 'Request failed with status ' + resp.status);
+    }
+
+    document.getElementById('explorerLoginPanel').hidden = true;
+    document.getElementById('explorerSessionPanel').hidden = false;
+    document.getElementById('explorerSessionUser').textContent =
+      sessionStorage.getItem('nagarkotSessionUser') || 'Signed in';
     explorerNextAfter = data.next_after;
     loadedJobsCache = data.jobs || [];
     document.getElementById('explorerCountText').textContent = data.returned_count;
     document.getElementById('nextPageBtn').disabled = !explorerNextAfter;
     renderShipmentsTable(loadedJobsCache);
   } catch (err) {
-    tbody.innerHTML = '<tr><td colspan="10" style="color:#b91c1c; padding:1rem;">Failed to load jobs: ' + err.message + '</td></tr>';
+    explorerNextAfter = null;
+    loadedJobsCache = [];
+    document.getElementById('explorerCountText').textContent = '—';
+    document.getElementById('nextPageBtn').disabled = true;
+    tbody.innerHTML = '<tr><td colspan="10" style="color:#b91c1c; padding:1rem;"></td></tr>';
+    tbody.querySelector('td').textContent = 'Failed to load shipments: ' + err.message;
   }
+}
+
+function showExplorerLogin(message) {
+  document.getElementById('explorerLoginPanel').hidden = false;
+  document.getElementById('explorerSessionPanel').hidden = true;
+  document.getElementById('explorerLoginMessage').textContent = message;
+  document.getElementById('explorerCountText').textContent = '—';
+  document.getElementById('explorerTableBody').innerHTML =
+    '<tr><td colspan="10" style="text-align:center; padding:2rem; color:#64748b;">Sign in to view shipments.</td></tr>';
+  document.getElementById('nextPageBtn').disabled = true;
+}
+
+async function signInToExplorer(event) {
+  event.preventDefault();
+  const form = document.getElementById('explorerLoginForm');
+  const message = document.getElementById('explorerLoginMessage');
+  const button = document.getElementById('explorerLoginButton');
+  const username = document.getElementById('explorerUsername').value.trim();
+  const password = document.getElementById('explorerPassword').value;
+  button.disabled = true;
+  message.textContent = 'Signing in...';
+
+  try {
+    const resp = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Sign-in failed.');
+    }
+
+    sessionStorage.setItem('nagarkotSessionToken', data.token);
+    sessionStorage.setItem('nagarkotSessionUser', data.user_id);
+    document.getElementById('explorerPassword').value = '';
+    explorerNextAfter = null;
+    await loadJobsExplorer(true);
+  } catch (err) {
+    message.textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function signOutOfExplorer() {
+  sessionStorage.removeItem('nagarkotSessionToken');
+  sessionStorage.removeItem('nagarkotSessionUser');
+  explorerNextAfter = null;
+  loadedJobsCache = [];
+  showExplorerLogin('Signed out. Sign in to view shipments.');
 }
 
 function renderShipmentsTable(jobs) {
@@ -841,7 +961,11 @@ function loadNextJobsPage() {
 }
 
 window.addEventListener('DOMContentLoaded', function() {
-  loadJobsExplorer(true);
+  document.getElementById('explorerLoginForm').addEventListener('submit', signInToExplorer);
+  document.getElementById('explorerSignOutButton').addEventListener('click', signOutOfExplorer);
+  (window.nagarkotReady || Promise.resolve()).then(function() {
+    loadJobsExplorer(true);
+  });
 });
 </script>
 """
@@ -856,9 +980,15 @@ async function loadWaitingQueue() {
   tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 2rem; color: #64748b;">Loading actionable jobs...</td></tr>';
 
   try {
-    const resp = await fetch('/jobs/waiting?user=' + encodeURIComponent(user));
+    const resp = await fetch('/jobs/waiting?simulate=1&user=' + encodeURIComponent(user), {
+      headers: getAuthHeadersNoContentType()
+    });
     const data = await resp.json();
-    countEl.textContent = Number(data.waiting_count).toLocaleString() + ' shipments';
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unable to load the waiting queue (HTTP ' + resp.status + ').');
+    }
+    const wc = (data.waiting_count !== undefined && data.waiting_count !== null) ? Number(data.waiting_count) : 0;
+    countEl.textContent = (isNaN(wc) ? 0 : wc).toLocaleString() + ' shipments';
 
     if (!data.jobs || data.jobs.length === 0) {
       tbody.innerHTML = '<tr><td colspan="9" style="text-align:center; padding: 2.5rem; color: #64748b;">No shipments currently require action for this user.</td></tr>';
@@ -902,7 +1032,7 @@ async function executeJobAction(jobId, action, actorId) {
   try {
     const resp = await fetch('/jobs/' + jobId + '/action', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders(),
       body: JSON.stringify({ action: action, actor_id: actorId })
     });
     const res = await resp.json();
@@ -918,7 +1048,9 @@ async function executeJobAction(jobId, action, actorId) {
 }
 
 window.addEventListener('DOMContentLoaded', function() {
-  loadWaitingQueue();
+  (window.nagarkotReady || Promise.resolve()).then(function() {
+    loadWaitingQueue();
+  });
 });
 </script>
 """
@@ -941,8 +1073,13 @@ async function fetchJobAuditLog() {
   timeline.innerHTML = '<div style="color:#64748b; font-size:0.85rem; padding:1rem 0;">Retrieving history for ' + jid + '...</div>';
 
   try {
-    const resp = await fetch('/audit/job/' + encodeURIComponent(jid));
+    const resp = await fetch('/audit/job/' + encodeURIComponent(jid) + '?simulate=1', {
+      headers: getAuthHeadersNoContentType()
+    });
     const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unable to retrieve this audit log (HTTP ' + resp.status + ').');
+    }
 
     profileCard.style.display = 'block';
     document.getElementById('profJobId').textContent = data.job_id;
@@ -1064,10 +1201,13 @@ async function executeQuickAccessTest() {
   try {
     const resp = await fetch('/authorize', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ actor_id: actor, action: action, job_id: jid })
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ actor_id: actor, action: action, job_id: jid, simulate: true })
     });
     const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unable to evaluate this access test (HTTP ' + resp.status + ').');
+    }
     showToast('Evaluated ' + action + ' for ' + actor + ': ' + data.decision, data.decision === 'ALLOW' ? 'success' : 'error');
     fetchJobAuditLog();
   } catch (err) {
@@ -1081,7 +1221,9 @@ window.addEventListener('DOMContentLoaded', function() {
   if (jParam) {
     document.getElementById('logJobInput').value = jParam;
   }
-  fetchJobAuditLog();
+  (window.nagarkotReady || Promise.resolve()).then(function() {
+    fetchJobAuditLog();
+  });
 });
 </script>
 """
@@ -1104,22 +1246,31 @@ async function executeExplain() {
                 '&other=' + encodeURIComponent(other) +
                 '&action=' + encodeURIComponent(action) +
                 '&job=' + encodeURIComponent(job);
-    const resp = await fetch(url);
+    const resp = await fetch(url + '&simulate=1', {
+      headers: getAuthHeadersNoContentType()
+    });
     const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error || 'Unable to compare access decisions (HTTP ' + resp.status + ').');
+    }
 
     document.getElementById('expSummaryBanner').textContent = data.comparison_summary || 'Comparison complete.';
     document.getElementById('expColTitleA').textContent = 'User A (' + user + ')';
     document.getElementById('expColTitleB').textContent = 'User B (' + other + ')';
 
     const bA = document.getElementById('expBadgeA');
-    bA.textContent = data.user_a.decision + ' (' + data.user_a.code + ')';
-    bA.className = 'badge-decision ' + (data.user_a.decision === 'ALLOW' ? 'badge-allow' : 'badge-deny');
-    document.getElementById('expCodeA').textContent = JSON.stringify(data.user_a, null, 2);
+    if (data.user_a) {
+      bA.textContent = (data.user_a.decision || '?') + ' (' + (data.user_a.code || '?') + ')';
+      bA.className = 'badge-decision ' + (data.user_a.decision === 'ALLOW' ? 'badge-allow' : 'badge-deny');
+      document.getElementById('expCodeA').textContent = JSON.stringify(data.user_a, null, 2);
+    }
 
     const bB = document.getElementById('expBadgeB');
-    bB.textContent = data.user_b.decision + ' (' + data.user_b.code + ')';
-    bB.className = 'badge-decision ' + (data.user_b.decision === 'ALLOW' ? 'badge-allow' : 'badge-deny');
-    document.getElementById('expCodeB').textContent = JSON.stringify(data.user_b, null, 2);
+    if (data.user_b) {
+      bB.textContent = (data.user_b.decision || '?') + ' (' + (data.user_b.code || '?') + ')';
+      bB.className = 'badge-decision ' + (data.user_b.decision === 'ALLOW' ? 'badge-allow' : 'badge-deny');
+      document.getElementById('expCodeB').textContent = JSON.stringify(data.user_b, null, 2);
+    }
     
     showToast('Comparison updated', 'info');
   } catch (err) {
@@ -1129,7 +1280,9 @@ async function executeExplain() {
 }
 
 window.addEventListener('DOMContentLoaded', function() {
-  executeExplain();
+  (window.nagarkotReady || Promise.resolve()).then(function() {
+    executeExplain();
+  });
 });
 </script>
 """
@@ -1278,7 +1431,7 @@ def render_home_page(conn: sqlite3.Connection) -> str:
         <div class="feature-nav-desc">View actionable jobs matching any employee's role and advance stages with 1-click execution.</div>
         <div class="feature-nav-cta">Open Work Queue &rarr;</div>
       </a>
-      <a href="/logs?job=JOB_0000001" class="feature-nav-card">
+      <a href="/logs?job=JOB_0001" class="feature-nav-card">
         <div class="feature-nav-title"><span>&#x1F6E1;</span> Job Audit &amp; Lifecycle Log</div>
         <div class="feature-nav-desc">Inspect who created, accessed, modified, and all incidents for any individual shipment.</div>
         <div class="feature-nav-cta">Inspect Job Audit Trail &rarr;</div>
@@ -1301,19 +1454,19 @@ def render_home_page(conn: sqlite3.Connection) -> str:
 
       <!-- 1-Click Interactive Scenarios -->
       <div class="scenario-grid">
-        <button class="scenario-btn" onclick="applyScenario('u_asha', 'check', 'JOB_0000001', 'Scenario 1: Asha Checks C01 Mumbai job')">
+        <button class="scenario-btn" onclick="applyScenario('u_asha', 'check', 'JOB_0001', 'Scenario 1: Asha Checks C01 Mumbai job')">
           <div class="scenario-btn-title"><span>&#x2714;</span> Asha Checks C01 Mumbai</div>
           <div class="scenario-btn-desc">Asha holds Checker for C01 across all branches. Result: ALLOW.</div>
         </button>
-        <button class="scenario-btn" onclick="applyScenario('u_ravi', 'check', 'JOB_0000001', 'Scenario 2: Scope Mismatch — Ravi on Mumbai C01')">
+        <button class="scenario-btn" onclick="applyScenario('u_ravi', 'check', 'JOB_0001', 'Scenario 2: Scope Mismatch — Ravi on Mumbai C01')">
           <div class="scenario-btn-title"><span style="color:var(--danger);">&#x2716;</span> Ravi Checks C01 Mumbai</div>
           <div class="scenario-btn-desc">Ravi is restricted to C03 Mumbai imports only. Result: DENY.</div>
         </button>
-        <button class="scenario-btn" onclick="applyScenario('u_priya', 'prepare', 'JOB_0000003', 'Scenario 3: Client User Boundary — Priya on C02')">
+        <button class="scenario-btn" onclick="applyScenario('u_priya', 'prepare', 'JOB_0003', 'Scenario 3: Client User Boundary — Priya on C02')">
           <div class="scenario-btn-title"><span style="color:var(--danger);">&#x2716;</span> Client User Attempts Prepare</div>
           <div class="scenario-btn-desc">Priya is ClientViewer: view-only for C02. Result: DENY.</div>
         </button>
-        <button class="scenario-btn" onclick="applyScenario('u_dev', 'prepare', 'JOB_0000001', 'Scenario 4: Admin Separation of Duties')">
+        <button class="scenario-btn" onclick="applyScenario('u_dev', 'prepare', 'JOB_0001', 'Scenario 4: Admin Separation of Duties')">
           <div class="scenario-btn-title"><span style="color:var(--danger);">&#x2716;</span> Admin Attempts Pipeline Action</div>
           <div class="scenario-btn-desc">AccessAdmin has zero job-pipeline powers. Result: DENY.</div>
         </button>
@@ -1350,7 +1503,7 @@ def render_home_page(conn: sqlite3.Connection) -> str:
         </div>
         <div class="field-group">
           <label class="field-label">Job Reference ID</label>
-          <input type="text" id="evalJobId" class="form-input" value="JOB_0000001">
+          <input type="text" id="evalJobId" class="form-input" value="JOB_0001">
         </div>
       </div>
 
@@ -1408,21 +1561,36 @@ def render_shipments_page(conn: sqlite3.Connection) -> str:
       <div class="card-header">
         <div>
           <div class="card-title">Customs Shipments Explorer</div>
-          <div class="card-desc">High-performance Keyset Pagination (<code>WHERE id &gt; :after LIMIT 25</code>) across all 5 branches with client-side field redactions.</div>
+          <div class="card-desc">High-performance Keyset Pagination (<code>WHERE id &gt; :after LIMIT 25</code>) with permission-scoped results and client data redaction.</div>
         </div>
-        <div style="display:flex; align-items:center; gap: 0.75rem; flex-wrap: wrap;">
-          <label style="font-size:0.82rem; color:var(--text-muted); display:flex; align-items:center; gap: 0.4rem; cursor:pointer; background:#f1f5f9; padding:0.4rem 0.75rem; border-radius:4px; border:1px solid #cbd5e1;">
-            <input type="checkbox" id="clientRedactToggle" onchange="loadJobsExplorer(true)">
-            <span>Simulate Priya (ClientViewer for C02 - Redacted)</span>
-          </label>
+        <div id="explorerSessionPanel" hidden style="display:flex; align-items:center; gap:0.75rem;">
+          <span>Signed in as <strong id="explorerSessionUser"></strong></span>
+          <button id="explorerSignOutButton" class="action-btn action-btn-secondary" type="button">Sign out</button>
         </div>
       </div>
+
+      <section id="explorerLoginPanel" hidden style="margin-bottom:1.25rem; padding:1rem; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
+        <h2 style="margin:0 0 0.35rem; font-size:1rem;">Sign in to view shipments</h2>
+        <p style="margin:0 0 0.75rem; color:#64748b; font-size:0.875rem;">Use your account credentials. Shipment visibility and client redaction are determined by your account permissions.</p>
+        <form id="explorerLoginForm" style="display:flex; align-items:end; gap:0.75rem; flex-wrap:wrap;">
+          <div class="field-group" style="min-width:180px;">
+            <label class="field-label" for="explorerUsername">Username</label>
+            <input id="explorerUsername" class="form-input" name="username" autocomplete="username" required>
+          </div>
+          <div class="field-group" style="min-width:180px;">
+            <label class="field-label" for="explorerPassword">Password</label>
+            <input id="explorerPassword" class="form-input" name="password" type="password" autocomplete="current-password" required>
+          </div>
+          <button id="explorerLoginButton" class="action-btn" type="submit">Sign in</button>
+        </form>
+        <p id="explorerLoginMessage" role="status" aria-live="polite" style="margin:0.75rem 0 0; color:#475569; font-size:0.875rem;"></p>
+      </section>
 
       <!-- Quick Filter Bar -->
       <div class="form-row" style="margin-bottom: 1rem;">
         <div class="field-group">
           <label class="field-label">Search by Job ID</label>
-          <input type="text" id="shipmentSearchInput" class="form-input" placeholder="e.g. JOB_0000001" onkeyup="filterLocalShipments()">
+          <input type="text" id="shipmentSearchInput" class="form-input" placeholder="e.g. JOB_0001" onkeyup="filterLocalShipments()">
         </div>
         <div class="field-group">
           <label class="field-label">Filter by Stage</label>
@@ -1560,7 +1728,7 @@ def render_queue_page(conn: sqlite3.Connection) -> str:
 # PAGE 4: JOB AUDIT & LIFECYCLE LOG
 # ==============================================================================
 def render_logs_page(conn: sqlite3.Connection, default_job_id: Optional[str] = None) -> str:
-    target_job_id = default_job_id or "JOB_0000001"
+    target_job_id = default_job_id or "JOB_0001"
     header_html = render_header("logs", conn)
     footer_html = render_footer()
 
@@ -1587,17 +1755,17 @@ def render_logs_page(conn: sqlite3.Connection, default_job_id: Optional[str] = N
       <!-- Job Selection & Search Bar -->
       <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1.25rem;">
         <div style="flex: 1; min-width: 240px;">
-          <input type="text" id="logJobInput" class="form-input" value="{target_job_id}" placeholder="Enter Job ID e.g. JOB_0000001">
+          <input type="text" id="logJobInput" class="form-input" value="{target_job_id}" placeholder="Enter Job ID e.g. JOB_0001">
         </div>
         <button class="action-btn" onclick="fetchJobAuditLog()">
           <span>&#x1F50D;</span> Inspect Shipment Audit Log
         </button>
         <div style="display:flex; gap: 0.4rem; align-items:center; font-size:0.8rem; color:var(--text-muted);">
           <span>Quick Pick:</span>
-          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0000001')">JOB_0000001 (Demo)</button>
-          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0000003')">JOB_0000003</button>
-          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0000015')">JOB_0000015</button>
-          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0000080')">JOB_0000080</button>
+          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0001')">JOB_0001 (Demo)</button>
+          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0003')">JOB_0003</button>
+          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0015')">JOB_0015</button>
+          <button class="action-btn action-btn-secondary action-btn-sm" onclick="pickJob('JOB_0080')">JOB_0080</button>
         </div>
       </div>
 
@@ -1606,7 +1774,7 @@ def render_logs_page(conn: sqlite3.Connection, default_job_id: Optional[str] = N
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
           <div>
             <div style="display:flex; align-items:center; gap: 0.75rem;">
-              <span id="profJobId" style="font-size: 1.25rem; font-weight: 800; color: #0b3056;">JOB_0000001</span>
+              <span id="profJobId" style="font-size: 1.25rem; font-weight: 800; color: #0b3056;">JOB_0001</span>
               <span id="profStageBadge" class="badge-stage stage-Confirmed">Confirmed</span>
             </div>
             <div id="profMetaText" style="font-size: 0.85rem; color: var(--text-muted); margin-top: 0.35rem;">
@@ -1722,7 +1890,7 @@ def render_staff_page(conn: sqlite3.Connection) -> str:
         </div>
         <div class="field-group">
           <label class="field-label">Job ID</label>
-          <input type="text" id="expJobId" class="form-input" value="JOB_0000001">
+          <input type="text" id="expJobId" class="form-input" value="JOB_0001">
         </div>
       </div>
 

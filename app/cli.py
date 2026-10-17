@@ -51,7 +51,7 @@ def cmd_who_could_change(args):
         service = AccessService(conn)
         res = service.who_could_change(job_id=args.job, at_timestamp=args.at)
         print("=" * 70)
-        print(f"FORENSIC TIME MACHINE: Job {args.job} as of {args.at}")
+        print(f"FORENSIC TIME MACHINE: Job {res['job_id']} as of {args.at}")
         print("=" * 70)
         print(f"Job Baseline Then: Stage={res['job_state_then']['stage']}, Branch={res['job_state_then']['branch']}, Client={res['job_state_then']['client_id']}, PreparedBy={res['job_state_then']['prepared_by']}")
         print("\n--- Authorized Personnel At That Time ---")

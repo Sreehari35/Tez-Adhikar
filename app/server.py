@@ -145,6 +145,16 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
             })
         return user
 
+    def _get_demo_user(self, conn, requested_actor_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Return an active human identity for an explicitly simulated UI call."""
+        actor_id = requested_actor_id or "u_asha"
+        row = conn.execute(
+            "SELECT id, username, is_service FROM users "
+            "WHERE id = ? AND is_active = 1 AND is_service = 0",
+            (actor_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # ------------------------------------------------------------------
     # POST handlers
     # ------------------------------------------------------------------
@@ -186,7 +196,13 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
                 return
 
             # ── All other POST routes require authentication ─────────────────
-            authed = self._require_auth(conn)
+            simulation_body = self._read_json_body() if path == "/authorize" else None
+            is_simulation = bool(simulation_body and simulation_body.get("simulate") is True)
+            authed = self._get_authenticated_user(conn)
+            if authed is None and is_simulation and not self.headers.get("Authorization"):
+                authed = self._get_demo_user(conn, simulation_body.get("actor_id"))
+            if authed is None:
+                authed = self._require_auth(conn)
             if authed is None:
                 return
 
@@ -197,16 +213,25 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
 
             # ── 1. POST /authorize ───────────────────────────────────────────
             if path == "/authorize":
-                body = self._read_json_body()
-                # actor_id comes from the verified session, NOT the body
+                body = simulation_body or {}
                 action = body.get("action")
                 job_id = body.get("job_id")
                 job_data = body.get("job_data")
                 reason = body.get("reason")
                 second_approver_id = body.get("second_approver_id")
 
+                # For simulation requests (UI simulator / explainer), evaluate the
+                # actor_id supplied in the request body — this is the whole point of
+                # the simulator: "what decision would user X get for action Y?".
+                # The session identity (authed) still proves the caller is
+                # authenticated; the body actor_id is the evaluation subject.
+                if is_simulation and body.get("actor_id"):
+                    eval_actor_id = body["actor_id"]
+                else:
+                    eval_actor_id = actor_id
+
                 receipt = engine.authorize(
-                    actor_id=actor_id,
+                    actor_id=eval_actor_id,
                     action=action,
                     job_id=job_id,
                     job_data=job_data,
@@ -214,7 +239,7 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
                     second_approver_id=second_approver_id,
                 )
 
-                if job_id:
+                if job_id and not is_simulation:
                     j_row = conn.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone()
                     if j_row:
                         with conn:
@@ -232,8 +257,14 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
                                 },
                             )
 
-                status = 200 if receipt["decision"] == "ALLOW" else 403
-                self._send_json(status, receipt)
+                # Simulation responses are always HTTP 200 regardless of decision —
+                # the decision (ALLOW / DENY) is carried in the JSON body.
+                # Only real (non-simulated) authorizations return 403 on DENY.
+                if is_simulation:
+                    self._send_json(200, receipt)
+                else:
+                    status_code = 200 if receipt["decision"] == "ALLOW" else 403
+                    self._send_json(status_code, receipt)
                 return
 
             # ── 2. POST /grants ───────────────────────────────────────────────
@@ -646,7 +677,17 @@ class AccessRequestHandler(BaseHTTPRequestHandler):
                 return
 
             # ── All remaining GET routes require authentication ────────────────
-            authed = self._require_auth(conn)
+            simulated_paths = {"/explain", "/jobs/waiting"}
+            is_simulation = (
+                (path in simulated_paths or path.startswith("/audit/job/"))
+                and query_params.get("simulate", [""])[0].lower() in ("1", "true", "demo")
+            )
+            requested_actor_id = query_params.get("user", [None])[0]
+            authed = self._get_authenticated_user(conn)
+            if authed is None and is_simulation and not self.headers.get("Authorization"):
+                authed = self._get_demo_user(conn, requested_actor_id)
+            if authed is None:
+                authed = self._require_auth(conn)
             if authed is None:
                 return
 

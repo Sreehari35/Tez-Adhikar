@@ -28,6 +28,20 @@ class AccessService:
         self.conn = conn
         self.engine = DecisionEngine(conn)
 
+    def _resolve_job_id(self, job_id: str) -> str:
+        job_row = self.conn.execute("SELECT id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if job_row:
+            return job_row["id"]
+
+        prefix, separator, suffix = job_id.partition("_")
+        if prefix == "JOB" and separator and suffix.isascii() and suffix.isdigit() and len(suffix) < 7:
+            padded_job_id = f"JOB_{suffix.zfill(7)}"
+            job_row = self.conn.execute("SELECT id FROM jobs WHERE id = ?", (padded_job_id,)).fetchone()
+            if job_row:
+                return job_row["id"]
+
+        raise ValueError(f"Job {job_id} not found")
+
     def _require_admin(self, actor_id: str) -> None:
         if self.engine.authorize(actor_id=actor_id, action="manage_access")["decision"] != "ALLOW":
             raise PermissionError("Actor lacks 'manage_access' authority")
@@ -614,9 +628,8 @@ class AccessService:
         2. Who ACTUALLY acted on this job around that time (from audit ledger).
         """
         # Fetch job
+        job_id = self._resolve_job_id(job_id)
         job_row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        if not job_row:
-            raise ValueError(f"Job {job_id} not found")
         job = dict(job_row)
 
         # Find all active users at that time
@@ -683,10 +696,12 @@ class AccessService:
         """
         Explain side-by-side why User A can perform an action on a job, and User B cannot.
         """
+        job_id = self._resolve_job_id(job_id)
         rec_a = self.engine.authorize(actor_id=user_a_id, action=action, job_id=job_id)
         rec_b = self.engine.authorize(actor_id=user_b_id, action=action, job_id=job_id)
 
-        job = dict(self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+        job_row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        job = dict(job_row)
 
         return {
             "job_id": job_id,

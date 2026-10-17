@@ -251,6 +251,17 @@ class TestStage4ApiAndCli(unittest.TestCase):
         self.assertEqual(len(res2["jobs"]), 1)
         self.assertNotEqual(res["jobs"][0]["id"], res2["jobs"][0]["id"])
 
+    def test_shipments_page_prompts_for_authenticated_access(self):
+        req = urllib.request.Request(self._url("/shipments"))
+        with urllib.request.urlopen(req) as resp:
+            page = resp.read().decode("utf-8")
+
+        self.assertEqual(resp.status, 200)
+        self.assertIn('id="explorerLoginForm"', page)
+        self.assertIn('id="explorerLoginPanel"', page)
+        self.assertIn("Authorization", page)
+        self.assertNotIn("as_user=u_priya", page)
+
     def test_api_jobs_limit_zero_rejected(self):
         """limit=0 must be rejected with 400."""
         status, res = self._get("/jobs?limit=0", token=self.token_asha)
