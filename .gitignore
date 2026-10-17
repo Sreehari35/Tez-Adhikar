@@ -1,0 +1,26 @@
+# Runtime secrets and generated state
+data/*.db
+data/*.db-*
+data/.ledger_key
+data/.job_seal_key
+data/.receipt_key
+
+# Python/tooling output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-tmp/
+*.log
+*.tmp
+*.swp
+.coverage
+Thumbs.db
+.DS_Store
+
+# Local validation and packaging artifacts
+data/*_validation.db
+data/*_validation.db-*
+
+# Submission artifacts
+Tez-Adhikar-submission.zip
+Tez-Adhikar-NOT-READY.zip
